@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -192,23 +193,44 @@ var toolchains = []langToolchain{
 		lintSteps:   []gateStep{{name: "cargo clippy", binary: "cargo", args: []string{"clippy", "--", "-D", "warnings"}, optional: true}},
 		testStep:    &gateStep{name: "cargo test", binary: "cargo", args: []string{"test"}},
 	},
-	// Java: pom.xml (Maven) or build.gradle (Gradle)
+	// Java/Maven: pom.xml.
+	//
+	// Ordered before the two Gradle entries below: pom.xml is the unambiguous
+	// Maven signal, and a project carrying both build systems is Maven-primary.
+	// This preserves the ordering intent of the single conflated Java entry that
+	// used to claim pom.xml, build.gradle AND build.gradle.kts at once.
+	//
+	// That conflation was a detection bug: detectToolchain is first-match-wins
+	// and the Java entry came first, so EVERY Gradle project resolved to
+	// `mvn test` and failed with MissingProjectException in a repository that has
+	// no pom.xml anywhere. `optional: true` did not save it, because optional
+	// only skips when the BINARY is missing and mvn is commonly installed.
 	{
-		markerFiles: []string{"pom.xml", "build.gradle", "build.gradle.kts"},
+		markerFiles: []string{"pom.xml"},
 		lintSteps: []gateStep{{
 			name: "checkstyle", binary: "checkstyle", args: []string{"-c", "/google_checks.xml", "src/"}, optional: true,
 			configFiles: []string{"checkstyle.xml", "google_checks.xml", ".checkstyle"},
 		}},
 		testStep: &gateStep{name: "mvn test", binary: "mvn", args: []string{"test"}, optional: true},
 	},
-	// Kotlin: build.gradle.kts with .kt files
+	// Kotlin/Gradle: build.gradle.kts, the Kotlin DSL, so it precedes the plain
+	// build.gradle Java/Gradle entry below.
 	{
 		markerFiles: []string{"build.gradle.kts"},
 		lintSteps: []gateStep{{
 			name: "ktlint", binary: "ktlint", args: nil, optional: true,
 			configFiles: []string{".editorconfig", ".ktlint"},
 		}},
-		testStep: &gateStep{name: "gradle test", binary: "gradle", args: []string{"test"}, optional: true},
+		testStep: &gateStep{name: gradleTestStepName, binary: "gradle", args: []string{"test"}, optional: true},
+	},
+	// Java/Gradle: build.gradle, the Groovy DSL.
+	{
+		markerFiles: []string{"build.gradle"},
+		lintSteps: []gateStep{{
+			name: "checkstyle", binary: "checkstyle", args: []string{"-c", "/google_checks.xml", "src/"}, optional: true,
+			configFiles: []string{"checkstyle.xml", "google_checks.xml", ".checkstyle"},
+		}},
+		testStep: &gateStep{name: gradleTestStepName, binary: "gradle", args: []string{"test"}, optional: true},
 	},
 	// C#/.NET: *.csproj or *.sln
 	// changedExts: skip dotnet format when no .cs file is staged.
@@ -416,11 +438,11 @@ func (g *QualityGate) detectToolchain() *langToolchain {
 				// Glob pattern (e.g., "*.csproj")
 				matches, err := filepath.Glob(filepath.Join(dir, marker))
 				if err == nil && len(matches) > 0 {
-					return resolvePythonRunner(resolveGoBuildTags(resolveDartFlutter(&toolchains[i], dir), g.config.GoBuildTags), dir)
+					return resolveGradleWrapper(resolvePythonRunner(resolveGoBuildTags(resolveDartFlutter(&toolchains[i], dir), g.config.GoBuildTags), dir), dir)
 				}
 			} else {
 				if fileExists(filepath.Join(dir, marker)) {
-					return resolvePythonRunner(resolveGoBuildTags(resolveDartFlutter(&toolchains[i], dir), g.config.GoBuildTags), dir)
+					return resolveGradleWrapper(resolvePythonRunner(resolveGoBuildTags(resolveDartFlutter(&toolchains[i], dir), g.config.GoBuildTags), dir), dir)
 				}
 			}
 		}
@@ -576,6 +598,69 @@ func hasUVProject(dir string) bool {
 		}
 	}
 	return false
+}
+
+// gradleTestStepName is the gate step name of the Gradle test step.
+//
+// It is deliberately stable across wrapper-vs-bare resolution: disabled_steps in
+// .moai/config/sections/gate.yaml is keyed by step NAME, so a name that changed
+// with wrapper presence would silently break user config on any machine that
+// happens to lack the wrapper.
+const gradleTestStepName = "gradle test"
+
+// resolveGradleWrapper rewrites the Gradle test step to invoke the committed
+// wrapper the project actually owns, falling back to a bare `gradle` off $PATH
+// when the project has no wrapper.
+//
+// A bare `gradle` is wrong for most Gradle projects: the wrapper is
+// version-pinned, is what CI runs, and is frequently the only Gradle on the
+// machine. The step is optional, and an optional step whose binary misses
+// LookPath is skipped SILENTLY, so the gate reported PASS having run no tests at
+// all. That false green is worse than a loud failure.
+//
+// The wrapper form is a path already proved to exist, so the step drops
+// `optional`: the $PATH LookPath skip in executeStep would otherwise discard a
+// runner we know is there (mirrors resolvePytestRunner). The step name is
+// preserved throughout, see gradleTestStepName.
+//
+// A toolchain whose test step is not the Gradle one is returned unchanged.
+func resolveGradleWrapper(tc *langToolchain, dir string) *langToolchain {
+	if tc == nil || tc.testStep == nil || tc.testStep.name != gradleTestStepName || dir == "" {
+		return tc
+	}
+	wrapper := gradleWrapperPath(dir)
+	if wrapper == "" {
+		return tc // no project-local wrapper found; leave the table entry alone
+	}
+	step := *tc.testStep
+	step.binary = wrapper
+	step.optional = false
+	clone := &langToolchain{
+		markerFiles: tc.markerFiles,
+		vetSteps:    tc.vetSteps,
+		lintSteps:   tc.lintSteps,
+	}
+	clone.testStep = &step
+	return clone
+}
+
+// gradleWrapperPath returns the path to the project Gradle wrapper script, or ""
+// when the project has none.
+//
+// The wrapper task generates BOTH scripts in every project, so the
+// platform-correct one is preferred rather than whichever happens to be probed
+// first: gradlew.bat on Windows, the POSIX gradlew elsewhere.
+func gradleWrapperPath(dir string) string {
+	candidates := []string{"gradlew"}
+	if runtime.GOOS == "windows" {
+		candidates = []string{"gradlew.bat", "gradlew"}
+	}
+	for _, c := range candidates {
+		if p := filepath.Join(dir, c); fileExists(p) {
+			return p
+		}
+	}
+	return ""
 }
 
 // applyGoBuildTags returns a copy of step with the Go build-tags flag injected.
